@@ -119,6 +119,8 @@ Priority: agterm → tmux → Zellij → herdr → kitty → wezterm/Kaku → cm
 > }
 > ```
 >
+> Claude Code exempts a command only when every part of it matches, so the skill runs the launcher by its resolved path as a plain command, and passes a diff to review as `--stdin-file=PATH` (a launcher option) instead of piping it in.
+>
 > Terminals that use CLI tools instead of AppleScript (agterm, tmux, Zellij, herdr, kitty, wezterm, Kaku, cmux) are not affected.
 
 > **Disconnect-resilient tmux window mode:** set `REVDIFF_TMUX_WINDOW=1` in the launcher's environment to open revdiff in a persistent, server-owned tmux window instead of a client-owned `display-popup`. A dropped SSH or tmux client tears down a popup and kills the review, but a server-owned window survives the disconnect — reattach and the live review is still there. This is a launcher environment variable, not a revdiff flag.

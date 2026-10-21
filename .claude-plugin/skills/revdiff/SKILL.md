@@ -46,22 +46,25 @@ When the user asks to open an in-session review in revdiff (the conversation alr
 
 ## Reviewing a Diff That Lives Outside the Working Tree
 
-Some review targets are not the current repo state: a GitHub PR diff, a patch file on disk, or `git format-patch -1 --stdout` output. Pipe the unified diff into `revdiff --stdin` and the input is parsed as a real multi-file diff (one tree entry per file, hunk navigation, per-file annotations) instead of a context-only buffer. revdiff auto-detects the unified-diff signature; on a malformed patch the input falls back silently to raw-text mode.
+Some review targets are not the current repo state: a GitHub PR diff, a patch file on disk, or `git format-patch -1 --stdout` output. Feed the unified diff to `revdiff --stdin` and the input is parsed as a real multi-file diff (one tree entry per file, hunk navigation, per-file annotations) instead of a context-only buffer. revdiff auto-detects the unified-diff signature; on a malformed patch the input falls back silently to raw-text mode.
 
 Use this instead of the normal launcher flow when:
 - the user asks to "review PR #N", "review this patch", "review `gh pr diff` output", or supplies a patch URL/path
 - the diff describes commits that are not checked out locally (e.g. someone else's branch on a remote-only PR)
 - the user pastes a unified diff and asks for a review of *that diff*, not the working tree
 
-Example invocations (route through the same launcher resolver as the normal flow):
+Hand the diff to the launcher as a file with `--stdin-file=PATH`, a launcher option that feeds the file to revdiff as `--stdin`. Never pipe or redirect into the launcher: under Claude Code's sandbox a pipe or redirect keeps the whole command sandboxed, which breaks the Ghostty and iTerm2 launchers.
 
-```bash
-gh pr diff 123 | "$("${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" launch-revdiff.sh "${CLAUDE_PLUGIN_DATA}")" --stdin
-git format-patch -1 --stdout | "$("${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" launch-revdiff.sh "${CLAUDE_PLUGIN_DATA}")" --stdin
-cat /tmp/feature.patch | "$("${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" launch-revdiff.sh "${CLAUDE_PLUGIN_DATA}")" --stdin
-```
-
-If the launch fails with an `osascript` error, re-run the whole pipeline using the two-call form from "Ghostty / iTerm2 (osascript backends)" below (`gh pr diff 123 | /abs/path/to/launch-revdiff.sh --stdin`) — the failed attempt already consumed the piped input.
+1. For command output, write it to a private temp file and print the path, in one call; a failing producer removes the file and stops the flow:
+   ```bash
+   f=$(mktemp "${TMPDIR:-/tmp}/revdiff-input-XXXXXX") && gh pr diff 123 > "$f" && echo "$f" || { rm -f "$f"; false; }
+   ```
+   `git format-patch -1 --stdout` works the same way. A patch file already on disk needs no copy: use its path directly.
+2. Resolve the launcher and run it as in Step 2, with the file:
+   ```bash
+   /abs/path/printed/by/resolver/launch-revdiff.sh --stdin-file=/path/printed/in/step/1
+   ```
+3. After reading the launcher's output and exit status, remove the temp file from step 1 in a separate call. Never remove a patch file the user supplied.
 
 `--stdin` is mutually exclusive with refs, `--staged`, `--only`, `--all-files`, `--include`, `--exclude`, and `--annotations`, so do not combine with the Step 1 ref detection — go directly to Step 3 once the launcher returns. Annotations come back keyed by the real file paths from the diff (not by `--stdin-name`).
 
@@ -130,31 +133,21 @@ Pass `--filter-unreviewed` only when the user asks for the tree limited to files
 
 Pass `--cross-file-motion` only when the user explicitly asks for cursor motion to continue into adjacent files; never infer it automatically.
 
-Run the launcher through the override-chain resolver:
-
-```bash
-"$("${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" launch-revdiff.sh "${CLAUDE_PLUGIN_DATA}")" [base] [against] [--staged] [--untracked] [--filter-unreviewed] [--cross-file-motion] [--only=file1] [--all-files] [--exclude=prefix] [--description=text|--description-file=path]
-```
-
-The resolver and launcher MUST run in the same bash invocation — the resolver runs as a sub-shell substitution so the resolved path is consumed immediately as the executable. The resolver checks `user → bundled` (see `references/install.md` for override paths) and prints the first-found absolute path. Fall-through to the bundled launcher is the default when no overrides exist.
-
-**Failure mode**: if the resolver fails (no launcher in any layer), the command substitution produces an empty string and bash reports `: command not found` with exit 127. The resolver's stderr (`error: launcher not found in override chain: launch-revdiff.sh`) is preserved on the same output stream — check it to confirm the override path is correct (executable bit set, file present in one of the two layers).
-
-**Ghostty / iTerm2 (osascript backends)**: these backends drive the terminal through `osascript`, which Claude Code's sandbox blocks. Adding the launcher to `excludedCommands` doesn't fix this on its own, because the sandbox blocks all commands with `$( )` substitutions. If the launcher exits nonzero with an `osascript` error, the sandbox blocked it. Switch to two separate Bash calls instead, and keep using them for the rest of the session:
+Run the launcher through the override-chain resolver, in two separate Bash calls:
 
 1. Resolve the launcher on its own:
    ```bash
    "${CLAUDE_SKILL_DIR}/scripts/resolve-launcher.sh" launch-revdiff.sh "${CLAUDE_PLUGIN_DATA}"
    ```
-   If it exits nonzero, stop and report its stderr — do not run anything else.
-2. Run the absolute path it printed, literally, with the same arguments:
+   It checks `user → bundled` (see `references/install.md` for override paths) and prints the first-found absolute path. If it exits nonzero (`error: launcher not found in override chain: launch-revdiff.sh`), stop and report its stderr; the override file is missing or not executable.
+2. Run the printed path literally, shell-quoted, with the arguments:
    ```bash
-   /abs/path/printed/by/resolver/launch-revdiff.sh [base] [against] [--staged] ...
+   /abs/path/printed/by/resolver/launch-revdiff.sh [base] [against] [--staged] [--untracked] [--filter-unreviewed] [--cross-file-motion] [--only=file1] [--all-files] [--exclude=prefix] [--description=text|--description-file=path]
    ```
 
-The long-running-command guidance below applies to the second call only. If the second call also fails with an `osascript` error, do not retry again — tell the user to add `"excludedCommands": ["*/launch-revdiff.sh*"]` to their Claude Code `settings.json` (see `references/install.md`).
+Resolve again for every launch. Keep the second call a plain command, with no `$VAR` expansion, command substitution, pipe, redirect or cleanup in it: Ghostty and iTerm2 drive the terminal through `osascript`, which Claude Code's sandbox blocks, and Claude Code exempts a command from the sandbox only when every part of it matches the user's `*/launch-revdiff.sh*` exclusion (see `references/install.md`).
 
-**IMPORTANT — long-running command**: The launcher blocks until the user finishes reviewing in the TUI overlay, which can exceed the default bash tool timeout on many harnesses. Set the bash timeout parameter to the **maximum your harness allows** (e.g. 1800000 or higher on OpenCode). The resolver itself returns in milliseconds — the timeout cap applies to the launcher only. Do NOT use `run_in_background` for this — background-task handling is unreliable for interactive TUI launchers (processes may be killed unprompted, and polling loops can leave the session idle after the review finishes). If the review outlasts the timeout cap, the fallback in Step 3 handles it.
+**IMPORTANT — long-running command**: The launcher blocks until the user finishes reviewing in the TUI overlay, which can exceed the default bash tool timeout on many harnesses. Set the bash timeout parameter to the **maximum your harness allows** (e.g. 1800000 or higher on OpenCode) on the launcher call; the resolver returns in milliseconds. Do NOT use `run_in_background` for this — background-task handling is unreliable for interactive TUI launchers (processes may be killed unprompted, and polling loops can leave the session idle after the review finishes). If the review outlasts the timeout cap, the fallback in Step 3 handles it.
 
 **Disconnect-resilient tmux window mode**: when running under tmux, prefix the launcher with `REVDIFF_TMUX_WINDOW=1` to open revdiff in a persistent, server-owned tmux window instead of a client-owned `display-popup`. The review then survives a dropped SSH or tmux client — reattach and it is still there. This is a launcher environment variable, not a revdiff flag.
 
