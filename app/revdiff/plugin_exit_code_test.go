@@ -157,11 +157,13 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 		output     string
 		wantStderr bool
 		stdin      string
+		stdinFile  string
 	}{
 		{name: "clean", code: 0},
 		{name: "annotations", code: exitCodeAnnotations, output: "## file.go:1 (+)\ncomment\n"},
 		{name: "failure", code: 1, output: "partial output\n", wantStderr: true},
 		{name: "piped stdin", code: 0, stdin: pipedDiff},
+		{name: "stdin file", code: 0, stdin: "decoy on the launcher's own stdin\n", stdinFile: pipedDiff},
 	}
 
 	for _, launcher := range launchers {
@@ -181,7 +183,17 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 						script := filepath.Join(root, launcher.path)
 						args := append([]string{script}, launcher.args...)
 						seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
-						if tc.stdin != "" {
+						seenArgs := filepath.Join(t.TempDir(), "args-seen")
+						wantStdin := tc.stdin
+						srcFile := filepath.Join(t.TempDir(), "my patch's.diff")
+						switch {
+						case tc.stdinFile != "":
+							writeTestFile(t, srcFile, tc.stdinFile)
+							args = append(args, "--stdin-file="+srcFile)
+							env["FAKE_STDIN_FILE"] = seenStdin
+							env["FAKE_ARGS_FILE"] = seenArgs
+							wantStdin = tc.stdinFile
+						case tc.stdin != "":
 							args = append(args, "--stdin")
 							env["FAKE_STDIN_FILE"] = seenStdin
 						}
@@ -194,11 +206,18 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 						})
 						assert.Equal(t, tc.code, res.code)
 						assert.Equal(t, tc.output, res.stdout)
-						if tc.stdin != "" {
-							assertFileContent(t, seenStdin, tc.stdin)
+						if wantStdin != "" {
+							assertFileContent(t, seenStdin, wantStdin)
 							mode, err := os.ReadFile(seenStdin + ".mode") //nolint:gosec // path is a test-owned temp file
 							require.NoError(t, err)
 							assert.True(t, strings.HasPrefix(string(mode), "-rw-------"), "spool mode: %s", mode)
+						}
+						if tc.stdinFile != "" {
+							seen, err := os.ReadFile(seenArgs) //nolint:gosec // path is a test-owned temp file
+							require.NoError(t, err)
+							assert.Contains(t, strings.Split(string(seen), "\n"), "--stdin")
+							assert.NotContains(t, string(seen), "--stdin-file")
+							assertFileContent(t, srcFile, tc.stdinFile)
 						}
 						if launcher.relaysStderr && tc.wantStderr {
 							assert.Contains(t, res.stderr, unknownFlagError)
@@ -228,23 +247,67 @@ func TestShellLaunchersCapSpooledStdin(t *testing.T) {
 		".claude-plugin/skills/revdiff/scripts/launch-revdiff.sh",
 		"plugins/codex/skills/revdiff/scripts/launch-revdiff.sh",
 	} {
-		t.Run(path, func(t *testing.T) {
-			t.Parallel()
-			env := fakeLauncherEnv(t, launcherRun{backend: backend})
-			seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
-			env["FAKE_STDIN_FILE"] = seenStdin
-			res := runTestCmd(t, cmdReq{
-				dir:   root,
-				name:  "bash",
-				args:  []string{filepath.Join(root, path), "--stdin"},
-				env:   env,
-				stdin: oversized,
+		for _, fromFile := range []bool{false, true} {
+			t.Run(path+"/file="+strconv.FormatBool(fromFile), func(t *testing.T) {
+				t.Parallel()
+				env := fakeLauncherEnv(t, launcherRun{backend: backend})
+				seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
+				env["FAKE_STDIN_FILE"] = seenStdin
+				req := cmdReq{dir: root, name: "bash", args: []string{filepath.Join(root, path), "--stdin"}, env: env, stdin: oversized}
+				if fromFile {
+					src := filepath.Join(t.TempDir(), "big.diff")
+					writeTestFile(t, src, oversized)
+					req.args = []string{filepath.Join(root, path), "--stdin-file=" + src}
+					req.stdin = ""
+				}
+				res := runTestCmd(t, req)
+				assert.Equal(t, 0, res.code)
+				info, err := os.Stat(seenStdin)
+				require.NoError(t, err)
+				assert.Equal(t, int64(maxStdinSize+1), info.Size())
 			})
-			assert.Equal(t, 0, res.code)
-			info, err := os.Stat(seenStdin)
-			require.NoError(t, err)
-			assert.Equal(t, int64(maxStdinSize+1), info.Size())
-		})
+		}
+	}
+}
+
+func TestShellLaunchersRejectUnreadableStdinFile(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell launchers are not used on windows")
+	}
+
+	root := testRepoRoot(t)
+	backend := launcherBackends()[0]
+	tests := []struct {
+		name string
+		src  func(t *testing.T) string
+	}{
+		{name: "missing", src: func(t *testing.T) string { return filepath.Join(t.TempDir(), "absent.diff") }},
+		{name: "directory", src: func(t *testing.T) string { return t.TempDir() }},
+		{name: "empty value", src: func(*testing.T) string { return "" }},
+	}
+	for _, path := range []string{
+		".claude-plugin/skills/revdiff/scripts/launch-revdiff.sh",
+		"plugins/codex/skills/revdiff/scripts/launch-revdiff.sh",
+	} {
+		for _, tc := range tests {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				env := fakeLauncherEnv(t, launcherRun{backend: backend})
+				seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
+				env["FAKE_STDIN_FILE"] = seenStdin
+				res := runTestCmd(t, cmdReq{
+					dir:  root,
+					name: "bash",
+					args: []string{filepath.Join(root, path), "--stdin-file=" + tc.src(t)},
+					env:  env,
+				})
+				assert.Equal(t, 1, res.code)
+				assert.Contains(t, res.stderr, "--stdin-file")
+				assert.NoFileExists(t, seenStdin)
+				assert.Empty(t, leftoverStderrCaptures(t, env["TMPDIR"]))
+			})
+		}
 	}
 }
 

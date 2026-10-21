@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # launch revdiff in a terminal overlay (agterm/tmux/zellij/herdr/kitty/wezterm/cmux/ghostty/iterm2) and capture annotations.
 # source: .claude-plugin/skills/revdiff/scripts/launch-revdiff.sh (keep in sync)
-# usage: launch-revdiff.sh [ref] [--staged] [--untracked] [--filter-unreviewed] [--only=file1 ...]
+# usage: launch-revdiff.sh [ref] [--staged] [--untracked] [--filter-unreviewed] [--only=file1 ...] [--stdin | --stdin-file=PATH]
+# --stdin-file=PATH is a launcher option: it reaches revdiff as --stdin fed from PATH. a sandboxed
+# agent shell runs a command with a pipe or redirect in the sandbox, a plain argument escapes it
 # output: annotation text from revdiff stdout (empty if no annotations)
 # exit: 0 clean, 10 annotations captured, other nonzero failure
 
@@ -15,6 +17,24 @@ if [ -z "$REVDIFF_BIN" ]; then
     echo "install: brew install umputun/apps/revdiff (or download from https://github.com/umputun/revdiff/releases)" >&2
     exit 1
 fi
+
+STDIN_SRC=""
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --stdin-file=*)
+            STDIN_SRC="${arg#--stdin-file=}"
+            if [ -z "$STDIN_SRC" ] || [ ! -f "$STDIN_SRC" ] || [ ! -r "$STDIN_SRC" ]; then
+                echo "error: --stdin-file is not a readable regular file: $STDIN_SRC" >&2
+                exit 1
+            fi
+            ARGS+=(--stdin)
+            ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+# bash 3.2 treats an empty "${ARGS[@]}" as unbound under set -u
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 TMPBASE="${TMPDIR:-/tmp}"
 OUTPUT_FILE=$(mktemp "$TMPBASE/revdiff-output-XXXXXX")
@@ -41,14 +61,21 @@ done
 # in by redirect; with a terminal on stdin there is nothing to spool and revdiff
 # reports the missing input itself. the spool holds a whole diff in a possibly shared
 # temp dir, so it is created private. it stops one byte past revdiff's 64 MiB stdin
-# cap: an endless producer cannot fill the disk, and revdiff reports the overflow
-for arg in "$@"; do
-    if [ "$arg" = "--stdin" ] && [ ! -t 0 ]; then
-        (umask 077; head -c 67108865 > "$STDIN_FILE")
-        REVDIFF_CMD="$REVDIFF_CMD <$(sq "$STDIN_FILE")"
-        break
-    fi
-done
+# cap: an endless producer cannot fill the disk, and revdiff reports the overflow.
+# a --stdin-file source goes through the same spool, and this script's own stdin is
+# then left unread
+if [ -n "$STDIN_SRC" ]; then
+    (umask 077; head -c 67108865 <"$STDIN_SRC" >"$STDIN_FILE")
+    REVDIFF_CMD="$REVDIFF_CMD <$(sq "$STDIN_FILE")"
+else
+    for arg in "$@"; do
+        if [ "$arg" = "--stdin" ] && [ ! -t 0 ]; then
+            (umask 077; head -c 67108865 > "$STDIN_FILE")
+            REVDIFF_CMD="$REVDIFF_CMD <$(sq "$STDIN_FILE")"
+            break
+        fi
+    done
+fi
 
 write_rc_cmd() {
     local sentinel="$1"

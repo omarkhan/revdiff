@@ -36,6 +36,8 @@ cmux is detected before ghostty when `$CMUX_SURFACE_ID` is set, `__CFBundleIdent
 }
 ```
 
+Claude Code exempts a command only when every part of it matches, so the skill runs the launcher by its resolved path as a plain command, and passes a diff to review as `--stdin-file=PATH` instead of piping it in.
+
 Terminals using CLI tools (tmux, Zellij, herdr, kitty, wezterm, cmux) are not affected.
 
 ### Plan Review Plugin
@@ -73,8 +75,8 @@ chmod +x "${CLAUDE_PLUGIN_DATA}/scripts/launch-revdiff.sh"
 
 For example, to open revdiff in a fresh kitty window instead of an overlay, copy the bundled launcher and replace the existing `kitty @ launch` overlay block with a `kitty --detach --title "revdiff"` invocation, reusing the existing `$REVDIFF_CMD` variable (which is already correctly quoted) — do **not** rebuild the command line from `$*`.
 
-The override receives the same positional arguments the bundled launcher does (`[base] [against] [--staged] [--only=file1] [--all-files] [--exclude=prefix] [--description=text|--description-file=path]`). The bundled launcher sets `REVDIFF_EXIT_CODE_ON_ANNOTATIONS` internally; custom launchers should do the same, print captured annotations to stdout, preserve exit `10` as success-with-annotations, and relay revdiff's stderr to their own stderr on any exit code other than `0` or `10` so the failure text reaches the caller. Other nonzero statuses remain launcher failures.
+The override receives the same positional arguments the bundled launcher does (`[base] [against] [--staged] [--only=file1] [--all-files] [--exclude=prefix] [--description=text|--description-file=path]`), plus `--stdin-file=PATH` when the skill reviews a diff from a file. `--stdin-file` is a launcher option, not a revdiff flag: an override copied from an older bundled launcher passes it through to revdiff, which rejects it. Refresh the override from the current bundled launcher and reapply your terminal customization, or copy both the `--stdin-file` argument handling and its file-to-spool branch. The bundled launcher sets `REVDIFF_EXIT_CODE_ON_ANNOTATIONS` internally; custom launchers should do the same, print captured annotations to stdout, preserve exit `10` as success-with-annotations, and relay revdiff's stderr to their own stderr on any exit code other than `0` or `10` so the failure text reaches the caller. Other nonzero statuses remain launcher failures.
 
 The bundled launcher does the relay by capturing revdiff's stderr to a temp file and replaying it on a failing exit. An override that adds its own `EXIT` trap must name that temp file in the trap, or a `revdiff-err-*` file is left behind in `$TMPDIR` on every run.
 
-**Failure mode**: if the resolver finds no launcher in any layer (user / bundled), the skill's command substitution produces an empty string and bash reports `: command not found` with exit 127. The resolver's stderr (`error: launcher not found in override chain: launch-revdiff.sh`) is preserved — check it to confirm the override file is present and executable in one of the two layers above.
+**Failure mode**: if the resolver finds no launcher in any layer (user / bundled), it exits nonzero with `error: launcher not found in override chain: launch-revdiff.sh` on stderr and the skill stops before launching — check that the override file is present and executable in one of the two layers above.
