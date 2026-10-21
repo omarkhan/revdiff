@@ -84,6 +84,7 @@ type DiffLine struct {
 	ChangeType    ChangeType // changeAdd, ChangeRemove, ChangeContext, or ChangeDivider
 	IsBinary      bool       // true when this line is a binary file placeholder
 	IsPlaceholder bool       // true for non-content placeholders (broken symlink, non-regular file, too-long lines)
+	IsSubmodule   bool       // true for the placeholder standing in for a git submodule pointer change
 }
 
 // FileStatus represents the change type of a file in a VCS diff.
@@ -573,7 +574,8 @@ func (g *Git) FileDiff(req FileDiffRequest) ([]DiffLine, error) {
 	}
 
 	args := g.diffArgs(req.Ref, req.Staged)
-	args = append(args, unifiedContextArg(req.ContextLines))
+	// a diff.submodule=log setting would replace the pointer rows the gitlink check reads
+	args = append(args, unifiedContextArg(req.ContextLines), "--submodule=short")
 	args = append(args, g.pathArgs(req)...)
 
 	out, err := g.runGit(args...)
@@ -599,7 +601,95 @@ func (g *Git) FileDiff(req FileDiffRequest) ([]DiffLine, error) {
 		}
 	}
 
+	combined := combinedDiffRe.MatchString(out)
+	if g.gitlinkCandidate(req, lines, combined) {
+		gitlink, err := g.isGitlink(req)
+		if err != nil {
+			return nil, fmt.Errorf("check submodule for %s: %w", req.Path, err)
+		}
+		if gitlink {
+			return g.gitlinkPlaceholder(lines, combined), nil
+		}
+	}
+
 	return lines, nil
+}
+
+// gitlinkCandidate reports whether the diff may be a submodule change: every change row is a
+// pointer row, or there are no rows and the patch is a rename (no hunks) or a combined
+// merge-conflict diff (its @@@ hunks are not parsed). Other empty diffs skip the extra git call.
+// Rows alone cannot tell a gitlink from a file holding that text, so isGitlink confirms by mode.
+func (g *Git) gitlinkCandidate(req FileDiffRequest, lines []DiffLine, combined bool) bool {
+	rows := 0
+	for _, l := range lines {
+		if l.ChangeType == ChangeDivider {
+			continue
+		}
+		if (l.ChangeType != ChangeAdd && l.ChangeType != ChangeRemove) || !gitlinkRowRe.MatchString(l.Content) {
+			return false
+		}
+		rows++
+	}
+	if rows > 0 {
+		return true
+	}
+	return combined || (req.OldPath != "" && req.OldPath != req.Path)
+}
+
+// isGitlink reports whether either side of the requested comparison has the gitlink mode 160000.
+// It reads git diff --raw for the same ref, staged flag and paths as the patch, since a dirty
+// submodule whose pointer has not moved carries no mode line in the patch itself.
+func (g *Git) isGitlink(req FileDiffRequest) (bool, error) {
+	args := g.diffArgs(req.Ref, req.Staged)
+	args = append(args, "--raw")
+	args = append(args, g.pathArgs(req)...)
+	out, err := g.runGit(args...)
+	if err != nil {
+		return false, err
+	}
+	for line := range strings.SplitSeq(out, "\n") {
+		meta, _, ok := strings.Cut(line, "\t")
+		if !ok || !strings.HasPrefix(meta, ":") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(meta, ":"))
+		if len(fields) >= 2 && (fields[0] == gitlinkMode || fields[1] == gitlinkMode) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// gitlinkPlaceholder replaces submodule pointer rows with one placeholder row naming the old and
+// new commits, so the pointer change is shown but never counted or reviewed as source content.
+func (g *Git) gitlinkPlaceholder(lines []DiffLine, combined bool) []DiffLine {
+	var oldRef, newRef string
+	for _, l := range lines {
+		m := gitlinkRowRe.FindStringSubmatch(l.Content)
+		if m == nil {
+			continue
+		}
+		ref := m[1][:min(len(m[1]), 7)] + m[2]
+		switch l.ChangeType {
+		case ChangeRemove:
+			oldRef = ref
+		case ChangeAdd:
+			newRef = ref
+		case ChangeContext, ChangeDivider:
+		}
+	}
+	content := "(submodule renamed, pointer unchanged)"
+	switch {
+	case combined:
+		content = "(submodule, unresolved merge conflict)"
+	case oldRef != "" && newRef != "":
+		content = fmt.Sprintf("(submodule %s → %s)", oldRef, newRef)
+	case newRef != "":
+		content = fmt.Sprintf("(new submodule at %s)", newRef)
+	case oldRef != "":
+		content = fmt.Sprintf("(deleted submodule, was %s)", oldRef)
+	}
+	return []DiffLine{{OldNum: 1, NewNum: 1, Content: content, ChangeType: ChangeContext, IsPlaceholder: true, IsSubmodule: true}}
 }
 
 // pathArgs builds the pathspec suffix for a file diff. For a rename (OldPath set
@@ -887,6 +977,15 @@ func appendGapDivider(lines []DiffLine, gap int) []DiffLine {
 // binaryFilesRe matches git's "Binary files ... differ" line for binary diffs.
 // Assumes English locale; non-English git may localize this message.
 var binaryFilesRe = regexp.MustCompile(`^Binary files .+ and .+ differ$`)
+
+// gitlinkRowRe matches the pointer row git prints for a submodule under --submodule=short.
+var gitlinkRowRe = regexp.MustCompile(`^Subproject commit ([0-9a-f]{7,64})(-dirty)?$`)
+
+// combinedDiffRe matches the header git prints for an unmerged path's combined diff.
+var combinedDiffRe = regexp.MustCompile(`(?m)^diff --cc `)
+
+// gitlinkMode is the git tree mode of a submodule entry.
+const gitlinkMode = "160000"
 
 // parseUnifiedDiff parses unified diff output into a slice of DiffLine entries.
 // it handles the diff header, hunk headers, and content lines.
