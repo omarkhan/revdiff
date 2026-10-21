@@ -89,11 +89,12 @@ If the bash tool reports a timeout, use the same fallback as the revdiff skill:
 2. Wait for the user to reply.
 3. Read the most recent output file:
    ```bash
-   output_file="$(ls -t "${TMPDIR:-/tmp}"/revdiff-output-* 2>/dev/null | head -1)"
+   output_file="$(find -H "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'revdiff-output-*' -user "$(id -u)" -mmin -120 -exec ls -t {} + 2>/dev/null | head -1)"
    if [ -n "$output_file" ] && [ -f "$output_file" ]; then
      cat "$output_file"
    fi
    ```
+   The lookup only considers your own files and excludes files older than two hours, but a recent leftover or another review of yours live under one `$TMPDIR` (a diff review included, since it uses the same file prefix) can still be the newest match.
 
 ### Step 3: Process Annotations
 
