@@ -113,7 +113,7 @@ Priority: agterm → tmux → Zellij → herdr → kitty → wezterm/Kaku → cm
 >
 > ```json
 > {
->   "permissions": {
+>   "sandbox": {
 >     "excludedCommands": ["*/launch-revdiff.sh*"]
 >   }
 > }
@@ -293,7 +293,7 @@ codex plugin add revdiff-planning@revdiff
 
 If you previously copied the skills manually, remove `~/.codex/skills/revdiff` and `~/.codex/skills/revdiff-plan` after installing the plugin so the plugin copy is the only one in use.
 
-Start a new session and trust the plugin hook through `/hooks`. The `Stop` hook runs only in Plan mode and first checks `last_assistant_message`; whenever that field has no complete `<proposed_plan>`, it reads the exact event transcript and selects the last assistant message for the matching `session_id` and `turn_id`, without depending on a provider-specific phase. A readable clarification turn is ignored. Missing or mismatched event data, dependencies, and launcher failures warn and fail open.
+Start a new session and trust the plugin hook through `/hooks`. The `Stop` hook runs only in Plan mode and first checks `last_assistant_message`; whenever that field has no complete `<proposed_plan>`, it reads the exact event transcript and selects the last assistant message for the matching `session_id` and `turn_id`, without depending on a provider-specific phase. A readable clarification turn is ignored. Codex reports Plan mode only in the transcript, so a turn whose transcript is missing or belongs to another session is skipped silently; missing dependencies and launcher failures warn and fail open.
 
 When annotations are present, the hook asks Codex to return the complete revised plan with a snapshot marker on the first line inside `<proposed_plan>`. The next round opens a rolling compare (`<new> <old>`); reviewed snapshots are replaced, and a clean review removes the final snapshot.
 
@@ -316,24 +316,28 @@ The `revdiff` plugin installs both interactive skills. The separate `revdiff-pla
 
 #### OpenCode
 
-revdiff integrates with [OpenCode](https://opencode.ai) via a tool, slash command, and plan-review plugin. The tool wraps the existing `launch-revdiff.sh` launcher, so terminal detection stays in sync automatically.
+revdiff integrates with [OpenCode](https://opencode.ai). V1 provides a tool, slash command, and plan-review plugin. V2 provides a CLI plugin for `/revdiff` and automatic plan review, using the shared launcher in the client's terminal environment.
 
-**Install:**
+**Install (automatically detects OpenCode v1 or v2):**
 
 ```bash
 cd plugins/opencode && bash setup.sh
 ```
 
-The setup script copies files to `~/.config/opencode/` and registers the plan-review plugin. The tool and plan-review plugin treat exit code `10` as success-with-annotations and keep captured output. See [plugins/opencode/README.md](plugins/opencode/README.md) for manual installation and details.
+The v2 CLI plugin is discovered automatically under `plugins/revdiff/`. It runs reviews locally and returns annotations to the session captured at launch. Automatic plan review handles live completion events only, deduplicated between local clients using an atomic marker per event ID. Markers older than one day are removed on the next claim. Clients must share the same state directory and local checkout; the winner may be in a window the user is not looking at. Restart OpenCode after installing.
+
+The installer uses `opencode --version` from `PATH`; use `bash setup.sh --opencode /path/to/opencode /path/to/config` to select another v2 installation. The v2 integration supports OpenCode v2.0.0+ and has no runtime npm dependencies. Its config directory follows `OPENCODE_CONFIG_DIR`, then XDG defaults. V1 installs only to `~/.config/opencode`. Upgrade removes the obsolete v1 plan plugin, Markdown command and exact JSON registration; JSONC is left untouched with a notice. V1 code remains unchanged, and rollback leaves the inert v2 directory in place. See [plugins/opencode/README.md](plugins/opencode/README.md) for prerequisites, ownership rules and migration details.
 
 **Commands inside OpenCode:**
 
+V2 also supports `/revdiff` from the home screen. A clean review leaves it unchanged; annotations create a feedback session using the configured default agent and selected model, falling back to the configured model on older v2 clients.
+
 ```text
 /revdiff                         -- review git diff with revdiff TUI
-/revdiff HEAD~3 HEAD             -- review last 3 commits
+/revdiff HEAD~3..HEAD             -- review last 3 commits
 ```
 
-The plan-review plugin automatically launches revdiff when the assistant exits plan mode, letting you annotate before approval.
+The v2 plan-review plugin automatically launches revdiff after a completed plan-agent response in the displayed root session. Annotations and a line-numbered snapshot of the reviewed plan are returned to that session for revision, so the agent does not need the deleted temporary file. V1 uses the plan-mode idle hook.
 
 #### General
 

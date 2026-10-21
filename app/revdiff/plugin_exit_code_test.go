@@ -114,6 +114,17 @@ func assistantTranscriptLine(t *testing.T, phase, text string) string {
 	return string(data) + "\n"
 }
 
+func taskStartedTranscriptLine(t *testing.T, turnID, mode string) string {
+	t.Helper()
+	payload := map[string]any{"type": "task_started", "turn_id": turnID}
+	if mode != "" {
+		payload["collaboration_mode_kind"] = mode
+	}
+	data, err := json.Marshal(map[string]any{"type": "event_msg", "payload": payload})
+	require.NoError(t, err)
+	return string(data) + "\n"
+}
+
 func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
@@ -126,15 +137,17 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 	unknownFlagError := "revdiff: unknown flag `--bogus-flag'"
 
 	launchers := []struct {
-		name         string
-		path         string
-		args         []string
-		relaysStderr bool
+		name          string
+		path          string
+		args          []string
+		relaysStderr  bool
+		forwardsStdin bool
 	}{
-		{name: "claude", path: ".claude-plugin/skills/revdiff/scripts/launch-revdiff.sh", relaysStderr: true},
-		{name: "codex", path: "plugins/codex/skills/revdiff/scripts/launch-revdiff.sh", relaysStderr: true},
+		{name: "claude", path: ".claude-plugin/skills/revdiff/scripts/launch-revdiff.sh", relaysStderr: true, forwardsStdin: true},
+		{name: "codex", path: "plugins/codex/skills/revdiff/scripts/launch-revdiff.sh", relaysStderr: true, forwardsStdin: true},
 		{name: "plan review", path: "plugins/revdiff-planning/scripts/launch-plan-review.sh", args: []string{planFile}},
 	}
+	pipedDiff := "--- a/file.go\n+++ b/file.go\n@@ -1 +1 @@\n-old\n+new\n"
 	// stderr relay fires on failure only: 0 is a clean quit and 10 means
 	// annotations were captured, and revdiff writes ordinary warnings to stderr,
 	// so relaying either would put noise on every successful review
@@ -143,10 +156,12 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 		code       int
 		output     string
 		wantStderr bool
+		stdin      string
 	}{
 		{name: "clean", code: 0},
 		{name: "annotations", code: exitCodeAnnotations, output: "## file.go:1 (+)\ncomment\n"},
 		{name: "failure", code: 1, output: "partial output\n", wantStderr: true},
+		{name: "piped stdin", code: 0, stdin: pipedDiff},
 	}
 
 	for _, launcher := range launchers {
@@ -155,6 +170,9 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 				t.Parallel()
 				for _, tc := range cases {
 					t.Run(tc.name, func(t *testing.T) {
+						if tc.stdin != "" && !launcher.forwardsStdin {
+							t.Skip("launcher takes no --stdin")
+						}
 						run := launcherRun{backend: backend, code: tc.code, output: tc.output}
 						if launcher.relaysStderr {
 							run.stderr = unknownFlagError
@@ -162,14 +180,26 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 						env := fakeLauncherEnv(t, run)
 						script := filepath.Join(root, launcher.path)
 						args := append([]string{script}, launcher.args...)
+						seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
+						if tc.stdin != "" {
+							args = append(args, "--stdin")
+							env["FAKE_STDIN_FILE"] = seenStdin
+						}
 						res := runTestCmd(t, cmdReq{
-							dir:  root,
-							name: "bash",
-							args: args,
-							env:  env,
+							dir:   root,
+							name:  "bash",
+							args:  args,
+							env:   env,
+							stdin: tc.stdin,
 						})
 						assert.Equal(t, tc.code, res.code)
 						assert.Equal(t, tc.output, res.stdout)
+						if tc.stdin != "" {
+							assertFileContent(t, seenStdin, tc.stdin)
+							mode, err := os.ReadFile(seenStdin + ".mode") //nolint:gosec // path is a test-owned temp file
+							require.NoError(t, err)
+							assert.True(t, strings.HasPrefix(string(mode), "-rw-------"), "spool mode: %s", mode)
+						}
 						if launcher.relaysStderr && tc.wantStderr {
 							assert.Contains(t, res.stderr, unknownFlagError)
 						} else {
@@ -182,6 +212,39 @@ func TestShellLaunchersPreserveAnnotationExitCode(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestShellLaunchersCapSpooledStdin(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell launchers are not used on windows")
+	}
+
+	root := testRepoRoot(t)
+	backend := launcherBackends()[0]
+	oversized := strings.Repeat("x", maxStdinSize+4096)
+	for _, path := range []string{
+		".claude-plugin/skills/revdiff/scripts/launch-revdiff.sh",
+		"plugins/codex/skills/revdiff/scripts/launch-revdiff.sh",
+	} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			env := fakeLauncherEnv(t, launcherRun{backend: backend})
+			seenStdin := filepath.Join(t.TempDir(), "stdin-seen")
+			env["FAKE_STDIN_FILE"] = seenStdin
+			res := runTestCmd(t, cmdReq{
+				dir:   root,
+				name:  "bash",
+				args:  []string{filepath.Join(root, path), "--stdin"},
+				env:   env,
+				stdin: oversized,
+			})
+			assert.Equal(t, 0, res.code)
+			info, err := os.Stat(seenStdin)
+			require.NoError(t, err)
+			assert.Equal(t, int64(maxStdinSize+1), info.Size())
+		})
 	}
 }
 
@@ -1123,6 +1186,15 @@ func TestCodexPlanReviewHook(t *testing.T) {
 		{name: "transcript from another session", payload: payload(fallbackEvent(map[string]any{"session_id": "session-other"})), transcript: planTranscript, withBinary: true, wantWarning: true},
 		{name: "missing transcript", payload: payload(fallbackEvent(map[string]any{"transcript_path": "$MISSING_TRANSCRIPT"})), withBinary: true, wantWarning: true},
 		{name: "malformed transcript", payload: payload(fallbackEvent(nil)), transcript: "{not-json\n", withBinary: true, wantWarning: true},
+		{name: "transcript plan mode reviews null message", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default"})), transcript: taskStartedTranscriptLine(t, "turn-current", "plan") + planTranscript, withBinary: true, wantLaunch: true, wantPlan: "# Plan from transcript\n- item"},
+		{name: "transcript plan mode survives non-object lines", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default"})), transcript: "[\"task_started\"]\n\"task_started\"\n" + taskStartedTranscriptLine(t, "turn-current", "plan") + planTranscript, withBinary: true, wantLaunch: true, wantPlan: "# Plan from transcript\n- item"},
+		{name: "transcript plan mode reviews message plan", payload: payload(fallbackEvent(map[string]any{"permission_mode": "bypassPermissions", "last_assistant_message": "<proposed_plan>\n# Plan\n- item\n</proposed_plan>"})), transcript: taskStartedTranscriptLine(t, "turn-current", "plan"), withBinary: true, wantLaunch: true, wantPlan: "# Plan\n- item"},
+		{name: "transcript default mode skips", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default", "last_assistant_message": "<proposed_plan>\n# Plan\n- item\n</proposed_plan>"})), transcript: taskStartedTranscriptLine(t, "turn-current", "default") + planTranscript, withBinary: true},
+		{name: "transcript without mode kind skips", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default"})), transcript: taskStartedTranscriptLine(t, "turn-current", "") + planTranscript, withBinary: true},
+		{name: "transcript plan mode of another turn skips", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default"})), transcript: taskStartedTranscriptLine(t, "turn-other", "plan") + planTranscript, withBinary: true},
+		{name: "default mode transcript from another session skips", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default", "session_id": "session-other"})), transcript: taskStartedTranscriptLine(t, "turn-current", "plan") + planTranscript, withBinary: true},
+		{name: "transcript plan mode with undecodable bytes warns", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default"})), transcript: taskStartedTranscriptLine(t, "turn-current", "plan") + strings.Repeat("{\"type\":\"filler\"}\n", 10000) + "\xff\xfe\n", withBinary: true, wantWarning: true},
+		{name: "default mode missing transcript skips", payload: payload(fallbackEvent(map[string]any{"permission_mode": "default", "transcript_path": "$MISSING_TRANSCRIPT"})), withBinary: true},
 		{name: "missing fallback identifiers", payload: payload(map[string]any{"last_assistant_message": "No plan block"}), withBinary: true, wantWarning: true},
 		{name: "missing revdiff", payload: payload(nil), wantWarning: true},
 		{name: "launcher failure", payload: payload(nil), code: 1, withBinary: true, wantWarning: true, wantLaunch: true, wantPlan: "# Plan\n- item"},
