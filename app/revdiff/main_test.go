@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,6 +142,49 @@ func TestFinalize(t *testing.T) {
 				return
 			}
 			assert.Empty(t, buf.String())
+		})
+	}
+}
+
+func TestFinalize_LoadError(t *testing.T) {
+	output := "## file.go:1 (+)\ncomment\n"
+	tests := []struct {
+		name        string
+		output      string
+		discarded   bool
+		signaled    bool
+		wantErr     bool
+		wantHistory bool
+		wantStdout  string
+	}{
+		{name: "no annotations reports the load error", output: "", wantErr: true},
+		{name: "discarded without annotations reports the load error", output: "", discarded: true, wantErr: true},
+		{name: "signaled without annotations reports the load error", output: "", signaled: true, wantErr: true},
+		{name: "annotations are written despite the load error", output: output, wantHistory: true, wantStdout: output},
+		{name: "signaled with annotations saves history only", output: output, signaled: true, wantHistory: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			histDir := t.TempDir()
+			var buf bytes.Buffer
+			code, err := finalize(finalizeReq{
+				opts:        options{HistoryDir: histDir},
+				annotations: tt.output,
+				files:       []string{"file.go"},
+				discarded:   tt.discarded,
+				workDir:     "repo",
+				signaled:    tt.signaled,
+				loadErr:     errors.New("bad revision"),
+				stdout:      &buf,
+			})
+			assert.Equal(t, 0, code)
+			assert.Equal(t, tt.wantHistory, historyFileCount(t, histDir) > 0)
+			assert.Equal(t, tt.wantStdout, buf.String())
+			if tt.wantErr {
+				require.EqualError(t, err, "load changed files: bad revision")
+				return
+			}
+			require.NoError(t, err)
 		})
 	}
 }
@@ -276,13 +321,19 @@ func TestTUIOutput_Open(t *testing.T) {
 
 func TestRun_RedirectedStdoutUsesTTY(t *testing.T) {
 	if os.Getenv("REVDIFF_TUI_TEST_HELPER") == "1" {
-		opts, err := parseArgs([]string{
+		args := []string{
 			"--config=" + os.Getenv("REVDIFF_TUI_TEST_CONFIG"),
-			"--annotations=" + os.Getenv("REVDIFF_TUI_TEST_ANNOTATIONS"),
 			"--history-dir=" + os.Getenv("REVDIFF_TUI_TEST_HISTORY"),
 			"--no-colors",
 			"--no-mouse",
-		})
+		}
+		if notes := os.Getenv("REVDIFF_TUI_TEST_ANNOTATIONS"); notes != "" {
+			args = append(args, "--annotations="+notes)
+		}
+		if ref := os.Getenv("REVDIFF_TUI_TEST_REF"); ref != "" {
+			args = append(args, ref)
+		}
+		opts, err := parseArgs(args)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "parse helper args: %v\n", err)
 			os.Exit(1)
@@ -295,6 +346,31 @@ func TestRun_RedirectedStdoutUsesTTY(t *testing.T) {
 		os.Exit(code)
 	}
 
+	const annotations = "## a.txt:2 (+)\npipe output stays clean\n"
+	notesPath := filepath.Join(t.TempDir(), "annotations.md")
+	require.NoError(t, os.WriteFile(notesPath, []byte(annotations), 0o600))
+
+	res := runPTYReview(t, map[string]string{"REVDIFF_TUI_TEST_ANNOTATIONS": notesPath}, "\x1b[?1049h")
+	assert.Equal(t, "0", res.status, "terminal: %q", res.terminal)
+	assert.Equal(t, annotations, res.stdout)
+	assert.NotContains(t, res.stdout, "\x1b[")
+}
+
+func TestRun_FailedFileLoadExitsWithError(t *testing.T) {
+	res := runPTYReview(t, map[string]string{"REVDIFF_TUI_TEST_REF": "no-such-ref"}, "no changed files")
+	assert.Equal(t, "1", res.status, "terminal: %q", res.terminal)
+	assert.Empty(t, res.stdout)
+	assert.Contains(t, res.terminal, "run helper: load changed files:")
+}
+
+type ptyReviewResult struct {
+	stdout   string
+	status   string
+	terminal string
+}
+
+func runPTYReview(t *testing.T, env map[string]string, marker string) ptyReviewResult {
+	t.Helper()
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("PTY integration is supported on darwin and linux")
 	}
@@ -332,12 +408,11 @@ func TestRun_RedirectedStdoutUsesTTY(t *testing.T) {
 	runMainTestGit(t, repo, "commit", "-qm", "initial")
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "a.txt"), []byte("one\nchanged\n"), 0o600))
 
-	const annotations = "## a.txt:2 (+)\npipe output stays clean\n"
-	notesPath := filepath.Join(t.TempDir(), "annotations.md")
-	require.NoError(t, os.WriteFile(notesPath, []byte(annotations), 0o600))
 	capturePath := filepath.Join(t.TempDir(), "stdout.txt")
+	statusPath := filepath.Join(t.TempDir(), "status.txt")
 	wrapperPath := filepath.Join(t.TempDir(), "run-revdiff.sh")
-	wrapper := "#!/bin/sh\n\"$REVDIFF_TEST_BINARY\" -test.run '^TestRun_RedirectedStdoutUsesTTY$' | cat > \"$REVDIFF_TEST_CAPTURE\"\n"
+	wrapper := "#!/bin/sh\n{ \"$REVDIFF_TEST_BINARY\" -test.run '^TestRun_RedirectedStdoutUsesTTY$'; " +
+		"echo $? > \"$REVDIFF_TEST_STATUS\"; } | cat > \"$REVDIFF_TEST_CAPTURE\"\n"
 	require.NoError(t, os.WriteFile(wrapperPath, []byte(wrapper), 0o600))
 	require.NoError(t, os.Chmod(wrapperPath, 0o700)) //nolint:gosec // executable test fixture
 	transcriptPath := filepath.Join(t.TempDir(), "terminal.fifo")
@@ -349,17 +424,19 @@ func TestRun_RedirectedStdoutUsesTTY(t *testing.T) {
 	}
 	cmd := exec.Command(scriptBin, args...) //nolint:gosec // fixed utility with test-controlled arguments
 	cmd.Dir = repo
-	cmd.Env = mergeEnv(map[string]string{
-		"REVDIFF_TUI_TEST_HELPER":      "1",
-		"REVDIFF_TUI_TEST_CONFIG":      filepath.Join(t.TempDir(), "missing-config"),
-		"REVDIFF_TUI_TEST_ANNOTATIONS": notesPath,
-		"REVDIFF_TUI_TEST_HISTORY":     filepath.Join(t.TempDir(), "history"),
-		"REVDIFF_TEST_BINARY":          os.Args[0],
-		"REVDIFF_TEST_CAPTURE":         capturePath,
-	})
+	fullEnv := map[string]string{
+		"REVDIFF_TUI_TEST_HELPER":  "1",
+		"REVDIFF_TUI_TEST_CONFIG":  filepath.Join(t.TempDir(), "missing-config"),
+		"REVDIFF_TUI_TEST_HISTORY": filepath.Join(t.TempDir(), "history"),
+		"REVDIFF_TEST_BINARY":      os.Args[0],
+		"REVDIFF_TEST_CAPTURE":     capturePath,
+		"REVDIFF_TEST_STATUS":      statusPath,
+	}
+	maps.Copy(fullEnv, env)
+	cmd.Env = mergeEnv(fullEnv)
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
-	terminal := &markerWriter{marker: "\x1b[?1049h", ready: make(chan struct{})}
+	terminal := &markerWriter{marker: marker, ready: make(chan struct{})}
 	var stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = io.Discard, &stderr
 	require.NoError(t, cmd.Start())
@@ -402,8 +479,9 @@ func TestRun_RedirectedStdoutUsesTTY(t *testing.T) {
 
 	captured, err := os.ReadFile(capturePath) //nolint:gosec // test-owned path
 	require.NoError(t, err)
-	assert.Equal(t, annotations, string(captured))
-	assert.NotContains(t, string(captured), "\x1b[")
+	status, err := os.ReadFile(statusPath) //nolint:gosec // test-owned path
+	require.NoError(t, err)
+	return ptyReviewResult{stdout: string(captured), status: strings.TrimSpace(string(status)), terminal: terminal.String()}
 }
 
 func TestHoldMainTestFIFOWriter_UnblocksLateReader(t *testing.T) {
