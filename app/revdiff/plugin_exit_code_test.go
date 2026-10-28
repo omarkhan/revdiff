@@ -275,7 +275,7 @@ func TestPlanLauncherTmuxWindowOptIn(t *testing.T) {
 			res := runTestCmd(t, cmdReq{
 				dir:  root,
 				name: "bash",
-				args: []string{filepath.Join(root, "plugins/revdiff-planning/scripts/launch-plan-review.sh"), planFile},
+				args: []string{filepath.Join(root, "plugins", "revdiff-planning", "scripts", "launch-plan-review.sh"), planFile},
 				env:  env,
 			})
 			assert.Equal(t, tc.code, res.code)
